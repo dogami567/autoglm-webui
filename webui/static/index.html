@@ -1,0 +1,895 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Open-AutoGLM WebUI</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      code { background: #f4f4f4; padding: 2px 6px; border-radius: 6px; }
+      .card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 16px; max-width: 1480px; }
+      .muted { color: #666; }
+      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      .row > * { flex: 0 0 auto; }
+      .col { display: grid; gap: 8px; }
+      .layout { display: grid; grid-template-columns: 1fr 420px; gap: 16px; align-items: start; }
+      input, select { padding: 8px 10px; border-radius: 10px; border: 1px solid #ddd; min-width: 240px; }
+      input[type="password"] { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      textarea { width: 100%; min-height: 72px; padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: #fff; cursor: pointer; }
+      button.primary { background: #111827; color: #fff; border-color: #111827; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; font-size: 12px; }
+      .panel { border: 1px solid #eee; border-radius: 12px; padding: 12px; }
+      .phone-frame { border-radius: 18px; border: 1px solid #1f2937; background: #0b1020; overflow: hidden; }
+      .phone-frame img { display: block; width: 100%; height: auto; background: #0b1020; }
+      .log { white-space: pre-wrap; background: #0b1020; color: #e5e7eb; padding: 12px; border-radius: 12px; min-height: 220px; max-height: 420px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+      .ok { color: #16a34a; }
+      .err { color: #ef4444; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; text-align: left; vertical-align: top; }
+      th { background: #fafafa; }
+      @media (max-width: 1100px) {
+        .layout { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Open-AutoGLM WebUI</h2>
+      <p class="muted">本页支持：设备选择/连通性检测、API Key→云端模式切换、任务启动/停止、SSE 实时日志与步骤计数。</p>
+
+      <div class="layout" style="margin-top: 12px">
+        <div class="col" id="leftPane">
+        <div class="row" style="align-items: flex-end">
+          <label>
+            <div class="muted">设备（ADB）</div>
+            <select id="deviceId" style="min-width: 360px">
+              <option value="">自动选择（默认）</option>
+            </select>
+          </label>
+          <button id="btnRefreshDevices">刷新设备</button>
+          <button id="btnCheck">连通性检测</button>
+          <span class="pill">devices: <span id="deviceCount">-</span></span>
+          <span class="pill">check: <span id="checkOverall" class="muted">-</span></span>
+        </div>
+        <div id="checkPanel" style="display:none; border: 1px solid #eee; border-radius: 12px; padding: 8px 10px;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 180px;">check</th>
+                <th style="width: 80px;">ok</th>
+                <th>message</th>
+              </tr>
+            </thead>
+            <tbody id="checkTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="row" style="align-items: flex-end">
+          <label>
+            <div class="muted">模式预设</div>
+            <select id="preset">
+              <option value="local">本地（Local vLLM）</option>
+              <option value="linkapi">LinkAPI（Gemini 中转）</option>
+              <option value="bigmodel">BigModel（云端）</option>
+              <option value="zai">z.ai（云端）</option>
+              <option value="custom">自定义（Custom）</option>
+            </select>
+          </label>
+
+          <label>
+            <div class="muted">Base URL</div>
+            <input id="baseUrl" type="text" placeholder="http://127.0.0.1:8000/v1" />
+          </label>
+
+          <label>
+            <div class="muted">Model</div>
+            <input id="modelName" type="text" placeholder="autoglm-phone-9b" />
+          </label>
+
+          <label>
+            <div class="muted">API Key（本地仅存 localStorage）</div>
+            <input id="apiKey" type="password" placeholder="留空=本地模式 / 填写=云端模式" />
+          </label>
+        </div>
+        <div class="muted" style="font-size: 12px">
+          规则：当 <code>API Key</code> 非空且非 <code>EMPTY</code> 时，自动切到云端预设；清空后回到本地预设。服务端日志不会明文输出 key。
+        </div>
+
+        <div class="row" style="align-items: flex-end">
+          <label>
+            <div class="muted">运行模式</div>
+            <select id="runMode" style="min-width: 240px">
+              <option value="direct">操控AI（直接执行）</option>
+              <option value="monitor">监控AI（拆解循环）</option>
+            </select>
+          </label>
+          <label id="monitorMaxRoundsWrap" style="display:none">
+            <div class="muted">max_rounds</div>
+            <input id="monitorMaxRounds" type="number" min="1" max="200" step="1" style="min-width: 120px" />
+          </label>
+          <label id="executorMaxStepsWrap" style="display:none">
+            <div class="muted">executor_max_steps</div>
+            <input id="executorMaxSteps" type="number" min="1" max="10" step="1" style="min-width: 140px" />
+          </label>
+        </div>
+
+        <div id="monitorLLMRow" class="row" style="align-items: flex-end; display:none">
+          <label>
+            <div class="muted">监控AI 预设</div>
+            <select id="monitorPreset" style="min-width: 240px">
+              <option value="local">本地（Local vLLM）</option>
+              <option value="linkapi">LinkAPI（Gemini 中转）</option>
+              <option value="bigmodel">BigModel（云端）</option>
+              <option value="zai">z.ai（云端）</option>
+              <option value="custom">自定义（Custom）</option>
+            </select>
+          </label>
+          <label>
+            <div class="muted">监控AI Base URL</div>
+            <input id="monitorBaseUrl" type="text" placeholder="https://api.linkapi.org/v1" />
+          </label>
+          <label>
+            <div class="muted">监控AI Model</div>
+            <input id="monitorModelName" type="text" placeholder="gemini-3-flash-preview" />
+          </label>
+          <label>
+            <div class="muted">监控AI temperature</div>
+            <input id="monitorTemperature" type="number" min="0" max="2" step="0.1" style="min-width: 160px" />
+          </label>
+          <label>
+            <div class="muted">监控AI API Key</div>
+            <input id="monitorApiKey" type="password" placeholder="可与操控AI不同" />
+          </label>
+        </div>
+
+        <div id="monitorPromptWrap" class="col" style="display:none">
+          <label for="monitorPrompt"><strong>Monitor Prompt</strong> <span class="muted">(可编辑)</span></label>
+          <textarea id="monitorPrompt" placeholder="监控AI prompt（建议输出一行子任务文本或 end: ...）"></textarea>
+          <label style="display: inline-flex; align-items: center; gap: 6px">
+            <input id="monitorUseScreenshot" type="checkbox" />
+            监控AI 传入截图（可能包含隐私/会发到云端）
+          </label>
+          <div class="muted" style="font-size: 12px">
+            监控AI负责拆解并循环下发子任务；当它输出 <code>end: ...</code>（或旧格式 <code>finish(message=&quot;end: ...&quot;)</code>）时结束整个循环。
+          </div>
+        </div>
+
+        <label for="task"><strong id="taskLabel">Task</strong></label>
+        <textarea id="task" placeholder="例如：打开小红书搜美食"></textarea>
+
+        <div class="row">
+          <button id="btnStart" class="primary">Start</button>
+          <button id="btnStop" disabled>Stop</button>
+          <label style="display: inline-flex; align-items: center; gap: 6px">
+            <span class="muted">max_steps</span>
+            <input id="maxSteps" type="number" min="1" max="500" step="1" style="min-width: 120px" />
+          </label>
+          <label style="display: inline-flex; align-items: center; gap: 6px">
+            <span class="muted">temperature</span>
+            <input id="temperature" type="number" min="0" max="2" step="0.1" style="min-width: 120px" />
+          </label>
+          <label style="display: inline-flex; align-items: center; gap: 6px">
+            <span class="muted">lang</span>
+            <select id="lang" style="min-width: 120px">
+              <option value="cn">cn</option>
+              <option value="en">en</option>
+            </select>
+          </label>
+          <label style="display: inline-flex; align-items: center; gap: 6px">
+            <input id="simulate" type="checkbox" />
+            simulate（不依赖模型/手机，仅用于联调）
+          </label>
+          <span class="pill">run_id: <span id="runId">-</span></span>
+          <span class="pill">steps: <span id="stepCount">0</span></span>
+          <span class="pill">status: <span id="status" class="muted">idle</span></span>
+        </div>
+
+        <div class="row">
+          <button id="btnClear">Clear logs</button>
+          <button id="btnCopy">Copy logs</button>
+          <label style="display: inline-flex; align-items: center; gap: 6px">
+            <input id="autoScroll" type="checkbox" checked />
+            auto-scroll
+          </label>
+          <span class="muted">后端接口：<code>POST /api/run</code> + <code>GET /api/run/stream</code></span>
+        </div>
+
+        <div class="muted" style="font-size: 12px; margin-top: 6px">Monitor 输出（monitor_decision / monitor_delegate / end）</div>
+        <div id="monitorLog" class="log" style="min-height: 140px; max-height: 260px"></div>
+        <div class="muted" style="font-size: 12px; margin-top: 10px">Executor 输出（step/action/log）</div>
+        <div id="executorLog" class="log"></div>
+        </div>
+
+        <div class="col" id="rightPane">
+          <div class="panel">
+            <div style="display: grid; gap: 6px">
+              <div><strong>手机监控</strong></div>
+              <div class="muted" style="font-size: 12px">网页预览=ADB 截图轮询；更顺滑可用 scrcpy（打开独立桌面窗口）。</div>
+            </div>
+
+            <div class="row" style="align-items: flex-end; margin-top: 10px">
+              <label style="display: inline-flex; align-items: center; gap: 6px">
+                <input id="screenMonitorEnabled" type="checkbox" />
+                开启网页监控
+              </label>
+              <label>
+                <div class="muted">interval(ms)</div>
+                <input id="screenMonitorInterval" type="number" min="250" max="10000" step="50" style="min-width: 140px" />
+              </label>
+              <button id="btnScreenOnce">刷新一帧</button>
+              <span class="pill">screen: <span id="screenState" class="muted">off</span></span>
+            </div>
+
+            <div class="row" style="align-items: flex-end; margin-top: 6px">
+              <button id="btnScrcpyStatus">scrcpy 状态</button>
+              <button id="btnScrcpyStart">打开 scrcpy</button>
+              <button id="btnScrcpyStop">关闭 scrcpy</button>
+              <span class="pill">scrcpy: <span id="scrcpyState" class="muted">-</span></span>
+            </div>
+            <div class="muted" style="font-size: 12px">
+              scrcpy 查找顺序：<code>SCRCPY_EXE</code> / <code>PATH</code> / <code>SCRCPY_DIR</code>（Windows 下通常是 scrcpy.exe）。
+            </div>
+
+            <div class="phone-frame" style="margin-top: 10px">
+              <img id="screenImg" alt="phone screen" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const state = {
+        runId: null,
+        stepCount: 0,
+        mode: "direct",
+        es: null,
+        screenTimer: null,
+      };
+
+      const DEFAULT_MONITOR_PROMPT_ZH = `你是“监控AI（Monitor Agent）”，你的职责是把用户的综合性目标拆解为一系列短的、可执行的手机操作子任务，并交给“操控AI（Phone Agent）”去执行。
+
+约束与工作方式：
+- 你每一轮只能输出 一行，不要输出任何额外解释/文字。
+- 你要让操控AI每次最多做 1~3 个动作，用于“推进进度或搜集信息”。如果任务需要更多动作，你应该拆成多轮。
+- 你会收到上一轮操控AI的观察结果（包含动作/结果/当前App等），你必须基于观察结果决定下一步。
+
+输出格式（必须严格遵守其一）：
+1) 下达子任务：
+直接输出任务文本（无需 do(...) 包裹），例如：
+打开XX应用，点击搜索框，在搜索框输入 美食 并回车。（最多 1~3 步）
+
+2) 结束整个循环（当你认为已完成用户目标或无法继续）：
+end: 结束原因/最终结论/需要用户接管的说明
+
+注意：
+- 子任务里不要包含敏感操作（支付/转账/删除/授权）除非用户明确要求，并尽量在需要时请求用户接管。
+- 尽量不要在子任务里使用英文双引号 ""（容易导致解析失败）；如需强调按钮文案，请用【我的】/《我的》这样的括号。
+- 如果观察结果表明点击/输入被系统拦截（例如 ADB input 注入失败），优先结束并提示用户修复环境。`;
+
+      const PRESETS = {
+        local: { base_url: "http://127.0.0.1:8000/v1", model: "autoglm-phone-9b" },
+        linkapi: { base_url: "https://api.linkapi.org/v1", model: "gemini-3-flash-preview" },
+        bigmodel: { base_url: "https://open.bigmodel.cn/api/paas/v4", model: "autoglm-phone" },
+        zai: { base_url: "https://api.z.ai/api/paas/v4", model: "autoglm-phone-multilingual" },
+        custom: { base_url: "", model: "" },
+      };
+
+      const STORAGE_KEYS = {
+        preset: "autoglm_webui_preset",
+        baseUrl: "autoglm_webui_base_url",
+        model: "autoglm_webui_model",
+        apiKey: "autoglm_webui_api_key",
+        temperature: "autoglm_webui_temperature",
+        deviceId: "autoglm_webui_device_id",
+        maxSteps: "autoglm_webui_max_steps",
+        lang: "autoglm_webui_lang",
+        runMode: "autoglm_webui_run_mode",
+        screenMonitorEnabled: "autoglm_webui_screen_monitor_enabled",
+        screenMonitorInterval: "autoglm_webui_screen_monitor_interval",
+        monitorPreset: "autoglm_webui_monitor_preset",
+        monitorBaseUrl: "autoglm_webui_monitor_base_url",
+        monitorModel: "autoglm_webui_monitor_model",
+        monitorApiKey: "autoglm_webui_monitor_api_key",
+        monitorTemperature: "autoglm_webui_monitor_temperature",
+        monitorPrompt: "autoglm_webui_monitor_prompt",
+        monitorUseScreenshot: "autoglm_webui_monitor_use_screenshot",
+        monitorMaxRounds: "autoglm_webui_monitor_max_rounds",
+        executorMaxSteps: "autoglm_webui_executor_max_steps",
+      };
+
+      function setStatus(text, isError = false) {
+        $("status").textContent = text;
+        $("status").className = isError ? "err" : "muted";
+      }
+
+      function getLogEl(target) {
+        return target === "monitor" ? $("monitorLog") : $("executorLog");
+      }
+
+      function appendLog(line, level = "info", target = "executor") {
+        const ts = new Date().toISOString().replace("T", " ").replace("Z", "");
+        const prefix = level === "error" ? "[ERR]" : level === "warn" ? "[WRN]" : "[INF]";
+        const text = `${ts} ${prefix} ${line}\n`;
+        const el = getLogEl(target);
+        if (!el) return;
+        el.textContent += text;
+        if ($("autoScroll").checked) el.scrollTop = el.scrollHeight;
+      }
+
+      function resetRunUi() {
+        state.runId = null;
+        state.stepCount = 0;
+        $("runId").textContent = "-";
+        $("stepCount").textContent = "0";
+        $("btnStart").disabled = false;
+        $("btnStop").disabled = true;
+      }
+
+      function closeStream() {
+        if (state.es) {
+          state.es.close();
+          state.es = null;
+        }
+      }
+
+      function loadConfig() {
+        const preset = localStorage.getItem(STORAGE_KEYS.preset) || "local";
+        $("preset").value = PRESETS[preset] ? preset : "local";
+        $("baseUrl").value = localStorage.getItem(STORAGE_KEYS.baseUrl) || PRESETS.local.base_url;
+        $("modelName").value = localStorage.getItem(STORAGE_KEYS.model) || PRESETS.local.model;
+        $("apiKey").value = localStorage.getItem(STORAGE_KEYS.apiKey) || "";
+        $("temperature").value = localStorage.getItem(STORAGE_KEYS.temperature) || "0";
+        autoSwitchPreset();
+
+        $("screenMonitorInterval").value = localStorage.getItem(STORAGE_KEYS.screenMonitorInterval) || "1200";
+        $("screenMonitorEnabled").checked = (localStorage.getItem(STORAGE_KEYS.screenMonitorEnabled) || "") === "1";
+        $("screenState").textContent = $("screenMonitorEnabled").checked ? "on" : "off";
+
+        const monitorPreset = localStorage.getItem(STORAGE_KEYS.monitorPreset) || $("preset").value;
+        $("monitorPreset").value = PRESETS[monitorPreset] ? monitorPreset : $("preset").value;
+        $("monitorBaseUrl").value = localStorage.getItem(STORAGE_KEYS.monitorBaseUrl) || $("baseUrl").value;
+        $("monitorModelName").value = localStorage.getItem(STORAGE_KEYS.monitorModel) || $("modelName").value;
+        $("monitorApiKey").value = localStorage.getItem(STORAGE_KEYS.monitorApiKey) || $("apiKey").value;
+        $("monitorTemperature").value = localStorage.getItem(STORAGE_KEYS.monitorTemperature) || $("temperature").value || "0";
+        autoSwitchMonitorPreset();
+
+        $("maxSteps").value = localStorage.getItem(STORAGE_KEYS.maxSteps) || "100";
+        $("lang").value = localStorage.getItem(STORAGE_KEYS.lang) || "cn";
+        $("runMode").value = localStorage.getItem(STORAGE_KEYS.runMode) || "direct";
+        $("monitorMaxRounds").value = localStorage.getItem(STORAGE_KEYS.monitorMaxRounds) || "30";
+        $("executorMaxSteps").value = localStorage.getItem(STORAGE_KEYS.executorMaxSteps) || "3";
+        $("monitorPrompt").value = localStorage.getItem(STORAGE_KEYS.monitorPrompt) || DEFAULT_MONITOR_PROMPT_ZH;
+        $("monitorUseScreenshot").checked = (localStorage.getItem(STORAGE_KEYS.monitorUseScreenshot) || "") === "1";
+        updateModeUi();
+      }
+
+      function saveConfig() {
+        localStorage.setItem(STORAGE_KEYS.preset, $("preset").value);
+        localStorage.setItem(STORAGE_KEYS.baseUrl, $("baseUrl").value || "");
+        localStorage.setItem(STORAGE_KEYS.model, $("modelName").value || "");
+        localStorage.setItem(STORAGE_KEYS.apiKey, $("apiKey").value || "");
+        localStorage.setItem(STORAGE_KEYS.temperature, $("temperature").value || "0");
+        localStorage.setItem(STORAGE_KEYS.deviceId, $("deviceId").value || "");
+        localStorage.setItem(STORAGE_KEYS.maxSteps, $("maxSteps").value || "100");
+        localStorage.setItem(STORAGE_KEYS.lang, $("lang").value || "cn");
+        localStorage.setItem(STORAGE_KEYS.runMode, $("runMode").value || "direct");
+        localStorage.setItem(STORAGE_KEYS.screenMonitorEnabled, $("screenMonitorEnabled").checked ? "1" : "0");
+        localStorage.setItem(STORAGE_KEYS.screenMonitorInterval, $("screenMonitorInterval").value || "1200");
+        localStorage.setItem(STORAGE_KEYS.monitorPreset, $("monitorPreset").value || "local");
+        localStorage.setItem(STORAGE_KEYS.monitorBaseUrl, $("monitorBaseUrl").value || "");
+        localStorage.setItem(STORAGE_KEYS.monitorModel, $("monitorModelName").value || "");
+        localStorage.setItem(STORAGE_KEYS.monitorApiKey, $("monitorApiKey").value || "");
+        localStorage.setItem(STORAGE_KEYS.monitorTemperature, $("monitorTemperature").value || "");
+        localStorage.setItem(STORAGE_KEYS.monitorMaxRounds, $("monitorMaxRounds").value || "30");
+        localStorage.setItem(STORAGE_KEYS.executorMaxSteps, $("executorMaxSteps").value || "3");
+        localStorage.setItem(STORAGE_KEYS.monitorPrompt, $("monitorPrompt").value || "");
+        localStorage.setItem(STORAGE_KEYS.monitorUseScreenshot, $("monitorUseScreenshot").checked ? "1" : "0");
+      }
+
+      function applyPreset(name) {
+        const p = PRESETS[name];
+        if (!p) return;
+        if (p.base_url) $("baseUrl").value = p.base_url;
+        if (p.model) $("modelName").value = p.model;
+      }
+
+      function applyMonitorPreset(name) {
+        const p = PRESETS[name];
+        if (!p) return;
+        if (p.base_url) $("monitorBaseUrl").value = p.base_url;
+        if (p.model) $("monitorModelName").value = p.model;
+      }
+
+      function getApiKeyValue() {
+        const k = ($("apiKey").value || "").trim();
+        if (!k || k.toUpperCase() === "EMPTY") return "";
+        return k;
+      }
+
+      function getMonitorApiKeyValue() {
+        const k = ($("monitorApiKey").value || "").trim();
+        if (!k || k.toUpperCase() === "EMPTY") return "";
+        return k;
+      }
+
+      function autoSwitchPreset() {
+        const hasKey = !!getApiKeyValue();
+        const current = $("preset").value;
+        if (hasKey) {
+          if (current === "local") {
+            $("preset").value = "linkapi";
+            applyPreset("linkapi");
+          }
+        } else {
+          if (current !== "local") {
+            $("preset").value = "local";
+            applyPreset("local");
+          }
+        }
+      }
+
+      function autoSwitchMonitorPreset() {
+        const hasKey = !!getMonitorApiKeyValue();
+        const current = $("monitorPreset").value;
+        if (hasKey) {
+          if (current === "local") {
+            $("monitorPreset").value = "linkapi";
+            applyMonitorPreset("linkapi");
+          }
+        } else {
+          if (current !== "local") {
+            $("monitorPreset").value = "local";
+            applyMonitorPreset("local");
+          }
+        }
+      }
+
+      function updateModeUi() {
+        const mode = $("runMode").value || "direct";
+        state.mode = mode;
+        const isMonitor = mode === "monitor";
+        $("monitorLLMRow").style.display = isMonitor ? "flex" : "none";
+        $("monitorPromptWrap").style.display = isMonitor ? "grid" : "none";
+        $("monitorMaxRoundsWrap").style.display = isMonitor ? "block" : "none";
+        $("executorMaxStepsWrap").style.display = isMonitor ? "block" : "none";
+
+        $("taskLabel").textContent = isMonitor ? "Goal" : "Task";
+        $("task").placeholder = isMonitor
+          ? "例如：打开小红书，搜索美食，浏览前10条并总结3个关键点"
+          : "例如：打开小红书搜美食";
+
+        // In monitor mode, maxSteps is controlled by executor_max_steps.
+        $("maxSteps").disabled = isMonitor;
+      }
+
+      let lastScreenErrorTs = 0;
+
+      function setScreenState(text, isError = false) {
+        $("screenState").textContent = text;
+        $("screenState").className = isError ? "err" : "muted";
+      }
+
+      function getScreenIntervalMs() {
+        const raw = Number(($("screenMonitorInterval").value || "1200").trim() || "1200");
+        if (!Number.isFinite(raw)) return 1200;
+        return Math.max(250, Math.min(10000, raw));
+      }
+
+      function buildScreenUrl() {
+        const device_id = ($("deviceId").value || "").trim();
+        const qs = new URLSearchParams();
+        if (device_id) qs.set("device_id", device_id);
+        qs.set("ts", String(Date.now()));
+        return `/api/screen?${qs.toString()}`;
+      }
+
+      function refreshScreenOnce() {
+        setScreenState("loading");
+        $("screenImg").src = buildScreenUrl();
+      }
+
+      function stopScreenMonitor() {
+        if (state.screenTimer) {
+          clearInterval(state.screenTimer);
+          state.screenTimer = null;
+        }
+        setScreenState("off");
+        $("screenImg").removeAttribute("src");
+      }
+
+      function startScreenMonitor() {
+        if (state.screenTimer) return;
+        setScreenState("on");
+        refreshScreenOnce();
+        state.screenTimer = setInterval(() => {
+          if (!$("screenMonitorEnabled").checked) return;
+          refreshScreenOnce();
+        }, getScreenIntervalMs());
+      }
+
+      function restartScreenMonitorIfRunning() {
+        if (!state.screenTimer) return;
+        clearInterval(state.screenTimer);
+        state.screenTimer = null;
+        startScreenMonitor();
+      }
+
+      function syncScreenMonitor() {
+        if ($("screenMonitorEnabled").checked) startScreenMonitor();
+        else stopScreenMonitor();
+      }
+
+      async function refreshScrcpyStatus({ quiet = false } = {}) {
+        try {
+          const resp = await fetch("/api/scrcpy/status");
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) throw new Error(`GET /api/scrcpy/status ${resp.status} ${JSON.stringify(data)}`);
+
+          const running = !!data.running;
+          $("scrcpyState").textContent = running ? `running(pid=${data.pid})` : (data.scrcpy_exe ? "stopped" : "not found");
+          $("scrcpyState").className = running ? "ok" : (data.scrcpy_exe ? "muted" : "err");
+
+          $("btnScrcpyStart").disabled = running || !data.scrcpy_exe;
+          $("btnScrcpyStop").disabled = !running;
+
+          if (!quiet && data.hint) appendLog(`scrcpy: ${data.hint}`);
+        } catch (e) {
+          $("scrcpyState").textContent = "error";
+          $("scrcpyState").className = "err";
+          $("btnScrcpyStart").disabled = true;
+          $("btnScrcpyStop").disabled = true;
+          if (!quiet) appendLog(`scrcpy status failed: ${String(e)}`, "warn");
+        }
+      }
+
+      async function startScrcpy() {
+        const device_id = ($("deviceId").value || "").trim();
+        appendLog(`scrcpy start: device_id=${device_id || "(auto)"}`);
+        try {
+          const resp = await fetch("/api/scrcpy/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ device_id }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) throw new Error(`POST /api/scrcpy/start ${resp.status} ${JSON.stringify(data)}`);
+          appendLog(`scrcpy started: pid=${data.pid} device_id=${data.device_id || ""}`);
+        } catch (e) {
+          appendLog(`scrcpy start failed: ${String(e)}`, "error");
+        } finally {
+          refreshScrcpyStatus({ quiet: true });
+        }
+      }
+
+      async function stopScrcpy() {
+        appendLog("scrcpy stop requested", "warn");
+        try {
+          const resp = await fetch("/api/scrcpy/stop", { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) throw new Error(`POST /api/scrcpy/stop ${resp.status} ${JSON.stringify(data)}`);
+          appendLog(`scrcpy stop: ${JSON.stringify(data)}`, "warn");
+        } catch (e) {
+          appendLog(`scrcpy stop failed: ${String(e)}`, "error");
+        } finally {
+          refreshScrcpyStatus({ quiet: true });
+        }
+      }
+
+      async function refreshDevices() {
+        $("btnRefreshDevices").disabled = true;
+        $("deviceCount").textContent = "-";
+        const sel = $("deviceId");
+        const wanted = localStorage.getItem(STORAGE_KEYS.deviceId) || "";
+        sel.innerHTML = '<option value=\"\">自动选择（默认）</option>';
+
+        try {
+          const resp = await fetch("/api/devices");
+          if (!resp.ok) throw new Error(`GET /api/devices ${resp.status}`);
+          const data = await resp.json();
+          const devices = data.devices || [];
+          $("deviceCount").textContent = String(devices.length);
+          for (const d of devices) {
+            const id = d.device_id || "";
+            const st = d.state || "";
+            const opt = document.createElement("option");
+            opt.value = id;
+            opt.textContent = `${id} (${st})`;
+            sel.appendChild(opt);
+          }
+          if (wanted) sel.value = wanted;
+          saveConfig();
+          appendLog(`devices refreshed: count=${devices.length}`);
+        } catch (e) {
+          appendLog(`devices refresh failed: ${String(e)}`, "warn");
+        } finally {
+          $("btnRefreshDevices").disabled = false;
+        }
+      }
+
+      function renderCheckResult(resp) {
+        const overall = resp.overall || "-";
+        $("checkOverall").textContent = overall;
+        $("checkOverall").className = overall === "pass" ? "ok" : overall === "fail" ? "err" : "muted";
+        const tbody = $("checkTableBody");
+        tbody.innerHTML = "";
+        for (const c of (resp.checks || [])) {
+          const tr = document.createElement("tr");
+          const tdName = document.createElement("td");
+          tdName.textContent = c.name || "";
+          const tdOk = document.createElement("td");
+          tdOk.textContent = c.ok ? "OK" : "FAIL";
+          tdOk.className = c.ok ? "ok" : "err";
+          const tdMsg = document.createElement("td");
+          tdMsg.textContent = c.message || "";
+          tr.appendChild(tdName);
+          tr.appendChild(tdOk);
+          tr.appendChild(tdMsg);
+          tbody.appendChild(tr);
+        }
+        $("checkPanel").style.display = "block";
+      }
+
+      async function connectivityCheck() {
+        const device_id = ($("deviceId").value || "").trim();
+        $("btnCheck").disabled = true;
+        $("checkOverall").textContent = "checking";
+        $("checkOverall").className = "muted";
+        appendLog(`connectivity-check start: device_id=${device_id || "(auto)"}`);
+        try {
+          const resp = await fetch("/api/connectivity-check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ device_id }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) throw new Error(`POST /api/connectivity-check ${resp.status} ${JSON.stringify(data)}`);
+          renderCheckResult(data);
+          appendLog(`connectivity-check overall=${data.overall} device_id=${data.device_id || ""}`, data.overall === "pass" ? "info" : "warn");
+        } catch (e) {
+          appendLog(`connectivity-check failed: ${String(e)}`, "error");
+          $("checkOverall").textContent = "error";
+          $("checkOverall").className = "err";
+        } finally {
+          $("btnCheck").disabled = false;
+        }
+      }
+
+      async function startRun() {
+        const task = $("task").value.trim();
+        if (!task) {
+          appendLog("task is required", "warn");
+          return;
+        }
+
+        closeStream();
+        resetRunUi();
+        setStatus("starting...");
+        $("btnStart").disabled = true;
+        $("btnStop").disabled = false;
+
+        const mode = ($("runMode").value || "direct").trim();
+        autoSwitchPreset();
+        if (mode === "monitor") autoSwitchMonitorPreset();
+        saveConfig();
+        let temperature = Number(($("temperature").value || "0").trim() || "0");
+        if (!Number.isFinite(temperature)) temperature = 0;
+        temperature = Math.max(0, Math.min(2, temperature));
+
+        const payload = {
+          mode,
+          task,
+          device_type: "adb",
+          device_id: ($("deviceId").value || "").trim(),
+          max_steps: Number(($("maxSteps").value || "100").trim() || "100"),
+          lang: ($("lang").value || "cn").trim(),
+          base_url: ($("baseUrl").value || "").trim() || PRESETS.local.base_url,
+          model: ($("modelName").value || "").trim() || PRESETS.local.model,
+          api_key: getApiKeyValue() || "EMPTY",
+          temperature,
+        };
+        if (mode === "monitor") {
+          const mRaw = ($("monitorTemperature").value || "").trim();
+          let monitor_temperature = mRaw ? Number(mRaw) : temperature;
+          if (!Number.isFinite(monitor_temperature)) monitor_temperature = temperature;
+          monitor_temperature = Math.max(0, Math.min(2, monitor_temperature));
+
+          payload.goal = task;
+          payload.monitor_prompt = ($("monitorPrompt").value || "").trim();
+          payload.max_rounds = Number(($("monitorMaxRounds").value || "30").trim() || "30");
+          payload.executor_max_steps = Number(($("executorMaxSteps").value || "3").trim() || "3");
+          payload.monitor_base_url = ($("monitorBaseUrl").value || "").trim() || payload.base_url;
+          payload.monitor_model = ($("monitorModelName").value || "").trim() || payload.model;
+          payload.monitor_api_key = getMonitorApiKeyValue() || "EMPTY";
+          payload.monitor_temperature = monitor_temperature;
+          payload.monitor_use_screenshot = !!$("monitorUseScreenshot").checked;
+        }
+        if ($("simulate").checked) payload.simulate = true;
+
+        const resp = await fetch("/api/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          appendLog(`POST /api/run failed: ${resp.status} ${txt}`, "error");
+          setStatus("error", true);
+          resetRunUi();
+          return;
+        }
+
+        const data = await resp.json();
+        state.runId = data.run_id;
+        $("runId").textContent = state.runId;
+        setStatus("running");
+        appendLog(`run started: run_id=${state.runId}`);
+
+        state.es = new EventSource(`/api/run/stream?run_id=${encodeURIComponent(state.runId)}`);
+        state.es.onmessage = (ev) => {
+          try {
+            const e = JSON.parse(ev.data);
+            if (e.type === "step") {
+              if (state.mode === "monitor") {
+                state.stepCount += 1;
+              } else {
+                state.stepCount = Math.max(state.stepCount, (e.step ?? 0) + 1);
+              }
+              $("stepCount").textContent = String(state.stepCount);
+              const roundInfo = e.round !== undefined ? ` round=${e.round}` : "";
+              appendLog(`step=${e.step}${roundInfo} success=${e.success} finished=${e.finished}`, e.success ? "info" : "warn");
+              if (e.thinking) appendLog(`thinking: ${String(e.thinking).slice(0, 500)}`);
+              if (e.action) appendLog(`action: ${JSON.stringify(e.action)}`);
+              if (e.message) appendLog(`message: ${e.message}`);
+            } else if (e.type === "log") {
+              appendLog(e.message || "(log)", e.level || "info");
+            } else if (e.type === "start") {
+              const scope = e.scope ? ` scope=${e.scope}` : "";
+              const round = e.round !== undefined ? ` round=${e.round}` : "";
+              const temp = e.temperature !== undefined ? ` temperature=${e.temperature}` : "";
+              appendLog(`start${scope}${round}: model=${e.model} base_url=${e.base_url} api_key_set=${e.api_key_set}${temp}`);
+            } else if (e.type === "monitor_start") {
+              state.mode = "monitor";
+              const mModel = e.monitor_model || e.model || "";
+              const mUrl = e.monitor_base_url || e.base_url || "";
+              const eModel = e.executor_model || "";
+              const eUrl = e.executor_base_url || "";
+              const mTemp = e.monitor_temperature !== undefined ? ` monitor_temperature=${e.monitor_temperature}` : "";
+              const eTemp = e.executor_temperature !== undefined ? ` executor_temperature=${e.executor_temperature}` : "";
+              appendLog(
+                `monitor_start: goal=${e.goal} monitor_model=${mModel} monitor_base_url=${mUrl} executor_model=${eModel} executor_base_url=${eUrl}${mTemp}${eTemp} max_rounds=${e.max_rounds} executor_max_steps=${e.executor_max_steps}`,
+                "info",
+                "monitor"
+              );
+            } else if (e.type === "monitor_decision") {
+              appendLog(`monitor_decision round=${e.round}: ${e.raw}`, "info", "monitor");
+            } else if (e.type === "monitor_delegate") {
+              appendLog(`monitor_delegate round=${e.round}: ${e.task}`, "warn", "monitor");
+            } else if (e.type === "burst_end") {
+              appendLog(`burst_end round=${e.round}: ${e.message || ""}`);
+            } else if (e.type === "confirm_required") {
+              appendLog(`confirm_required: ${e.message} (default denied)`, "warn");
+            } else if (e.type === "takeover") {
+              appendLog(`takeover: ${e.message}`, "warn");
+            } else if (e.type === "end") {
+              const endTarget = state.mode === "monitor" ? "monitor" : "executor";
+              appendLog(`end: ${e.message || "done"}`, "info", endTarget);
+              setStatus("done");
+              closeStream();
+              resetRunUi();
+            } else if (e.type === "error") {
+              appendLog(`error: ${e.message || "unknown"}`, "error");
+              if (e.traceback) appendLog(e.traceback, "error");
+              setStatus("error", true);
+              closeStream();
+              resetRunUi();
+            } else {
+              appendLog(`event: ${ev.data}`);
+            }
+          } catch (err) {
+            appendLog(`parse event failed: ${String(err)}`, "error");
+          }
+        };
+        state.es.onerror = () => {
+          appendLog("SSE stream error (connection lost?)", "warn");
+        };
+      }
+
+      async function stopRun() {
+        setStatus("stopping...");
+        const resp = await fetch("/api/run/stop", { method: "POST" });
+        const data = await resp.json().catch(() => ({}));
+        appendLog(`stop requested: ${JSON.stringify(data)}`, "warn");
+      }
+
+      $("btnStart").addEventListener("click", () => startRun().catch((e) => appendLog(String(e), "error")));
+      $("btnStop").addEventListener("click", () => stopRun().catch((e) => appendLog(String(e), "error")));
+      $("btnClear").addEventListener("click", () => {
+        $("executorLog").textContent = "";
+        $("monitorLog").textContent = "";
+      });
+      $("btnCopy").addEventListener("click", async () => {
+        try {
+          const mon = $("monitorLog").textContent || "";
+          const exe = $("executorLog").textContent || "";
+          const combined = `--- monitor ---\n${mon}\n--- executor ---\n${exe}`;
+          await navigator.clipboard.writeText(combined);
+          appendLog("logs copied");
+        } catch (e) {
+          appendLog(`copy failed: ${String(e)}`, "warn");
+        }
+      });
+
+      $("preset").addEventListener("change", () => {
+        const v = $("preset").value;
+        if (v !== "custom") applyPreset(v);
+        saveConfig();
+      });
+      $("runMode").addEventListener("change", () => { updateModeUi(); saveConfig(); });
+      $("monitorPreset").addEventListener("change", () => {
+        const v = $("monitorPreset").value;
+        if (v !== "custom") applyMonitorPreset(v);
+        saveConfig();
+      });
+      $("deviceId").addEventListener("change", () => {
+        saveConfig();
+        if ($("screenMonitorEnabled").checked) refreshScreenOnce();
+      });
+      $("baseUrl").addEventListener("input", saveConfig);
+      $("modelName").addEventListener("input", saveConfig);
+      $("apiKey").addEventListener("input", () => { autoSwitchPreset(); saveConfig(); });
+      $("temperature").addEventListener("input", saveConfig);
+      $("monitorBaseUrl").addEventListener("input", saveConfig);
+      $("monitorModelName").addEventListener("input", saveConfig);
+      $("monitorApiKey").addEventListener("input", () => { autoSwitchMonitorPreset(); saveConfig(); });
+      $("monitorTemperature").addEventListener("input", saveConfig);
+      $("maxSteps").addEventListener("input", saveConfig);
+      $("lang").addEventListener("change", saveConfig);
+      $("monitorPrompt").addEventListener("input", saveConfig);
+      $("monitorUseScreenshot").addEventListener("change", saveConfig);
+      $("monitorMaxRounds").addEventListener("input", saveConfig);
+      $("executorMaxSteps").addEventListener("input", saveConfig);
+      $("btnRefreshDevices").addEventListener("click", () => refreshDevices().catch((e) => appendLog(String(e), "error")));
+      $("btnCheck").addEventListener("click", () => connectivityCheck().catch((e) => appendLog(String(e), "error")));
+
+      $("screenMonitorEnabled").addEventListener("change", () => {
+        syncScreenMonitor();
+        saveConfig();
+      });
+      $("screenMonitorInterval").addEventListener("input", () => {
+        restartScreenMonitorIfRunning();
+        saveConfig();
+      });
+      $("btnScreenOnce").addEventListener("click", () => refreshScreenOnce());
+
+      $("btnScrcpyStatus").addEventListener("click", () => refreshScrcpyStatus().catch((e) => appendLog(String(e), "error")));
+      $("btnScrcpyStart").addEventListener("click", () => startScrcpy().catch((e) => appendLog(String(e), "error")));
+      $("btnScrcpyStop").addEventListener("click", () => stopScrcpy().catch((e) => appendLog(String(e), "error")));
+
+      $("screenImg").addEventListener("load", () => {
+        if ($("screenMonitorEnabled").checked) setScreenState("on");
+      });
+      $("screenImg").addEventListener("error", () => {
+        setScreenState("error", true);
+        const now = Date.now();
+        if (now - lastScreenErrorTs > 5000) {
+          lastScreenErrorTs = now;
+          appendLog("screen capture failed: check device/adb and /api/screen", "warn");
+        }
+      });
+
+      loadConfig();
+      refreshDevices().finally(() => {
+        syncScreenMonitor();
+        refreshScrcpyStatus({ quiet: true });
+      });
+
+      // Basic health check hint
+      fetch("/api/health").then(() => appendLog("backend health: ok")).catch(() => appendLog("backend health: failed", "warn"));
+    </script>
+  </body>
+</html>

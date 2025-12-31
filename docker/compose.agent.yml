@@ -1,0 +1,10 @@
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: ../Dockerfile
+    env_file:
+      - ../docker.env
+    stdin_open: true
+    tty: true
+    entrypoint: ["python", "main.py"]
