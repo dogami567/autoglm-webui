@@ -249,6 +249,7 @@
         mode: "direct",
         es: null,
         screenTimer: null,
+        deviceType: "adb", // default to adb, will be updated from /api/devices
       };
 
       const DEFAULT_MONITOR_PROMPT_ZH = `你是“监控AI（Monitor Agent）”，你的职责是把用户的综合性目标拆解为一系列短的、可执行的手机操作子任务，并交给“操控AI（Phone Agent）”去执行。
@@ -592,6 +593,13 @@ end: 结束原因/最终结论/需要用户接管的说明
           if (!resp.ok) throw new Error(`GET /api/devices ${resp.status}`);
           const data = await resp.json();
           const devices = data.devices || [];
+
+          // Update device type from backend
+          if (data.device_type) {
+            state.deviceType = data.device_type;
+            appendLog(`device_type: ${state.deviceType}`);
+          }
+
           $("deviceCount").textContent = String(devices.length);
           for (const d of devices) {
             const id = d.device_id || "";
@@ -683,7 +691,7 @@ end: 结束原因/最终结论/需要用户接管的说明
         const payload = {
           mode,
           task,
-          device_type: "adb",
+          device_type: state.deviceType,
           device_id: ($("deviceId").value || "").trim(),
           max_steps: Number(($("maxSteps").value || "100").trim() || "100"),
           lang: ($("lang").value || "cn").trim(),

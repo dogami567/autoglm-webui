@@ -33,12 +33,80 @@ def _find_adb() -> str | None:
 
     candidates = [
         REPO_ROOT / "platform-tools" / "adb.exe",
+        REPO_ROOT / "platform-tools" / "adb",  # Mac/Linux
         REPO_ROOT / "tools" / "platform-tools" / "adb.exe",
+        REPO_ROOT / "tools" / "platform-tools" / "adb",  # Mac/Linux
     ]
     for p in candidates:
         if p.exists():
             return str(p)
     return None
+
+
+def _list_ios_devices() -> list[dict[str, Any]]:
+    """List connected iOS devices using libimobiledevice."""
+    try:
+        from phone_agent.xctest import list_devices
+
+        devices_info = list_devices()
+        devices = []
+        for dev in devices_info:
+            devices.append({
+                "device_id": dev.device_id,
+                "state": "device" if dev.status == "connected" else dev.status,
+                "model": dev.model or "Unknown",
+                "name": dev.device_name or "iOS Device",
+                "ios_version": dev.ios_version or "Unknown",
+                "connection_type": dev.connection_type.value if hasattr(dev.connection_type, 'value') else str(dev.connection_type),
+            })
+        return devices
+    except Exception as e:
+        raise RuntimeError(f"Failed to list iOS devices: {e}")
+
+
+def _check_ios_device_connectivity(device_id: str, wda_url: str = "http://localhost:8100") -> tuple[bool, str]:
+    """Check if iOS device is connected."""
+    try:
+        from phone_agent.xctest import XCTestConnection
+
+        conn = XCTestConnection(wda_url=wda_url)
+        is_connected = conn.is_connected(device_id=device_id if device_id else None)
+
+        if not is_connected:
+            return False, f"iOS device {device_id or '(any)'} not connected"
+
+        return True, f"iOS device connected: {device_id or 'auto-detected'}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _check_wda_status(wda_url: str = "http://localhost:8100") -> tuple[bool, str]:
+    """Check if WebDriverAgent is running and ready."""
+    try:
+        from phone_agent.xctest import XCTestConnection
+
+        conn = XCTestConnection(wda_url=wda_url)
+        if conn.is_wda_ready(timeout=2):
+            status = conn.get_wda_status()
+            if status:
+                return True, f"WebDriverAgent ready at {wda_url}"
+            return True, "WebDriverAgent running"
+        return False, f"WebDriverAgent not responding at {wda_url}"
+    except Exception as e:
+        return False, f"WDA check failed: {e}"
+
+
+def _capture_ios_screenshot(device_id: str | None = None, wda_url: str = "http://localhost:8100") -> bytes:
+    """Capture iOS screenshot via WebDriverAgent."""
+    try:
+        from phone_agent.xctest import get_screenshot
+
+        png_data = get_screenshot(device_id=device_id, wda_url=wda_url)
+        if not png_data:
+            raise RuntimeError("Screenshot capture returned empty data")
+        return png_data
+    except Exception as e:
+        raise RuntimeError(f"iOS screenshot failed: {e}")
 
 
 def _run_cmd(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
@@ -257,103 +325,161 @@ def health() -> dict[str, Any]:
 @app.get("/api/devices")
 def devices() -> dict[str, Any]:
     device_type = os.getenv("PHONE_AGENT_DEVICE_TYPE", "adb")
-    if device_type != "adb":
-        raise HTTPException(status_code=400, detail="Only adb is supported in WebUI for now")
 
-    adb = _find_adb()
-    if not adb:
-        raise HTTPException(
-            status_code=500,
-            detail="adb not found. Put adb on PATH or use repo/platform-tools/adb.exe",
-        )
+    if device_type == "ios":
+        try:
+            items = _list_ios_devices()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        return {"device_type": "ios", "count": len(items), "devices": items}
 
-    try:
-        items = _list_adb_devices(adb)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    elif device_type == "adb":
+        adb = _find_adb()
+        if not adb:
+            raise HTTPException(
+                status_code=500,
+                detail="adb not found. Put adb on PATH or use repo/platform-tools/adb",
+            )
 
-    return {"device_type": "adb", "count": len(items), "devices": items}
+        try:
+            items = _list_adb_devices(adb)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+        return {"device_type": "adb", "count": len(items), "devices": items}
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported device_type: {device_type}")
 
 
 @app.post("/api/connectivity-check")
 def connectivity_check(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     """
-    Connectivity checks for ADB devices.
+    Connectivity checks for ADB and iOS devices.
 
     Request JSON (optional):
+    - device_type: "adb" or "ios"
     - device_id: specify a target device when multiple devices exist.
+    - wda_url: WebDriverAgent URL for iOS (default: http://localhost:8100)
     """
     device_type = (payload.get("device_type") or os.getenv("PHONE_AGENT_DEVICE_TYPE") or "adb").strip()
-    if device_type != "adb":
-        raise HTTPException(status_code=400, detail="Only adb is supported in WebUI for now")
 
     logs: list[str] = []
     checks: list[dict[str, Any]] = []
 
-    adb = _find_adb()
-    if not adb:
-        checks.append({"name": "adb", "ok": False, "message": "adb not found"})
-        return {"overall": "fail", "checks": checks, "logs": logs}
+    if device_type == "ios":
+        wda_url = payload.get("wda_url") or os.getenv("PHONE_AGENT_WDA_URL") or "http://localhost:8100"
 
-    checks.append({"name": "adb", "ok": True, "message": f"adb: {adb}"})
+        # Check 1: iOS device connected
+        try:
+            devices = _list_ios_devices()
+        except Exception as e:
+            checks.append({"name": "devices", "ok": False, "message": f"List iOS devices failed: {e}"})
+            return {"overall": "fail", "checks": checks, "logs": logs}
 
-    try:
-        devices = _list_adb_devices(adb)
-    except Exception as e:
-        checks.append({"name": "devices", "ok": False, "message": str(e)})
-        return {"overall": "fail", "checks": checks, "logs": logs}
+        wanted = (payload.get("device_id") or os.getenv("PHONE_AGENT_DEVICE_ID") or "").strip()
+        online = [d for d in devices if d.get("state") == "device"]
+        chosen = None
+        if wanted:
+            chosen = next((d for d in devices if d.get("device_id") == wanted), None)
+            if not chosen:
+                checks.append({"name": "devices", "ok": False, "message": f"iOS device_id 未找到: {wanted}"})
+                return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
+        else:
+            chosen = online[0] if online else (devices[0] if devices else None)
 
-    wanted = (payload.get("device_id") or os.getenv("PHONE_AGENT_DEVICE_ID") or "").strip()
-    online = [d for d in devices if d.get("state") == "device"]
-    chosen = None
-    if wanted:
-        chosen = next((d for d in devices if d.get("device_id") == wanted), None)
-        if not chosen:
-            checks.append(
-                {
+        if not devices:
+            checks.append({"name": "devices", "ok": False, "message": "未检测到任何 iOS 设备"})
+            return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
+
+        if chosen and chosen.get("state") != "device":
+            checks.append({
+                "name": "devices",
+                "ok": False,
+                "message": f"iOS 设备状态异常: {chosen.get('device_id')} ({chosen.get('state')})"
+            })
+            return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
+
+        device_id = chosen["device_id"] if chosen else ""
+        checks.append({
+            "name": "devices",
+            "ok": True,
+            "message": f"iOS 设备 OK: {device_id} ({chosen.get('name', 'Unknown')})"
+        })
+
+        # Check 2: WebDriverAgent status
+        ok_wda, msg_wda = _check_wda_status(wda_url)
+        checks.append({"name": "wda", "ok": ok_wda, "message": msg_wda})
+
+        # Check 3: Device connectivity
+        ok_conn, msg_conn = _check_ios_device_connectivity(device_id, wda_url)
+        checks.append({"name": "connectivity", "ok": ok_conn, "message": msg_conn})
+
+        overall = "pass" if all(c["ok"] for c in checks) else "fail"
+        return {"overall": overall, "device_id": device_id, "wda_url": wda_url, "checks": checks, "logs": logs, "devices": devices}
+
+    elif device_type == "adb":
+        adb = _find_adb()
+        if not adb:
+            checks.append({"name": "adb", "ok": False, "message": "adb not found"})
+            return {"overall": "fail", "checks": checks, "logs": logs}
+
+        checks.append({"name": "adb", "ok": True, "message": f"adb: {adb}"})
+
+        try:
+            devices = _list_adb_devices(adb)
+        except Exception as e:
+            checks.append({"name": "devices", "ok": False, "message": str(e)})
+            return {"overall": "fail", "checks": checks, "logs": logs}
+
+        wanted = (payload.get("device_id") or os.getenv("PHONE_AGENT_DEVICE_ID") or "").strip()
+        online = [d for d in devices if d.get("state") == "device"]
+        chosen = None
+        if wanted:
+            chosen = next((d for d in devices if d.get("device_id") == wanted), None)
+            if not chosen:
+                checks.append({
                     "name": "devices",
                     "ok": False,
                     "message": f"device_id 未找到: {wanted}",
-                }
-            )
+                })
+                return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
+        else:
+            chosen = online[0] if online else (devices[0] if devices else None)
+
+        if not devices:
+            checks.append({"name": "devices", "ok": False, "message": "未检测到任何 adb 设备"})
             return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
-    else:
-        chosen = online[0] if online else (devices[0] if devices else None)
 
-    if not devices:
-        checks.append({"name": "devices", "ok": False, "message": "未检测到任何 adb 设备"})
-        return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
-
-    if chosen and chosen.get("state") != "device":
-        checks.append(
-            {
+        if chosen and chosen.get("state") != "device":
+            checks.append({
                 "name": "devices",
                 "ok": False,
                 "message": f"设备状态异常: {chosen.get('device_id')} ({chosen.get('state')})",
-            }
-        )
-        return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
+            })
+            return {"overall": "fail", "checks": checks, "logs": logs, "devices": devices}
 
-    device_id = chosen["device_id"] if chosen else ""
-    checks.append(
-        {
+        device_id = chosen["device_id"] if chosen else ""
+        checks.append({
             "name": "devices",
             "ok": True,
             "message": f"设备 OK: {device_id}",
-        }
-    )
+        })
 
-    ok_shot, msg_shot = _check_screenshot(adb, device_id)
-    checks.append({"name": "screenshot", "ok": ok_shot, "message": msg_shot})
+        ok_shot, msg_shot = _check_screenshot(adb, device_id)
+        checks.append({"name": "screenshot", "ok": ok_shot, "message": msg_shot})
 
-    ok_kb, msg_kb = _check_adb_keyboard(adb, device_id)
-    checks.append({"name": "adb_keyboard", "ok": ok_kb, "message": msg_kb})
+        ok_kb, msg_kb = _check_adb_keyboard(adb, device_id)
+        checks.append({"name": "adb_keyboard", "ok": ok_kb, "message": msg_kb})
 
-    ok_input, msg_input = _check_adb_input_injection(adb, device_id)
-    checks.append({"name": "adb_input", "ok": ok_input, "message": msg_input})
+        ok_input, msg_input = _check_adb_input_injection(adb, device_id)
+        checks.append({"name": "adb_input", "ok": ok_input, "message": msg_input})
 
-    overall = "pass" if all(c["ok"] for c in checks) else "fail"
-    return {"overall": overall, "device_id": device_id, "checks": checks, "logs": logs, "devices": devices}
+        overall = "pass" if all(c["ok"] for c in checks) else "fail"
+        return {"overall": overall, "device_id": device_id, "checks": checks, "logs": logs, "devices": devices}
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported device_type: {device_type}")
 
 
 @app.get("/api/screen")
@@ -362,31 +488,48 @@ def screen(device_id: str | None = None) -> Response:
     Return a single PNG screenshot for lightweight monitoring in WebUI.
 
     Query:
-    - device_id: optional adb serial; otherwise uses env PHONE_AGENT_DEVICE_ID or auto-pick.
+    - device_id: optional device serial; otherwise uses env PHONE_AGENT_DEVICE_ID or auto-pick.
     """
     device_type = os.getenv("PHONE_AGENT_DEVICE_TYPE", "adb")
-    if device_type != "adb":
-        raise HTTPException(status_code=400, detail="Only adb is supported in WebUI for now")
 
-    adb = _find_adb()
-    if not adb:
-        raise HTTPException(
-            status_code=500,
-            detail="adb not found. Put adb on PATH or use repo/platform-tools/adb.exe",
-        )
+    if device_type == "ios":
+        wda_url = os.getenv("PHONE_AGENT_WDA_URL") or "http://localhost:8100"
+        wanted = (device_id or os.getenv("PHONE_AGENT_DEVICE_ID") or "").strip() or None
 
-    wanted = (device_id or os.getenv("PHONE_AGENT_DEVICE_ID") or "").strip()
-    try:
-        chosen_id, _devices = _choose_adb_device(adb, wanted)
-        png = _capture_screencap_png(adb, chosen_id, timeout=15)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+        try:
+            png = _capture_ios_screenshot(device_id=wanted, wda_url=wda_url)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
 
-    headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    }
-    return Response(content=png, media_type="image/png", headers=headers)
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        }
+        return Response(content=png, media_type="image/png", headers=headers)
+
+    elif device_type == "adb":
+        adb = _find_adb()
+        if not adb:
+            raise HTTPException(
+                status_code=500,
+                detail="adb not found. Put adb on PATH or use repo/platform-tools/adb",
+            )
+
+        wanted = (device_id or os.getenv("PHONE_AGENT_DEVICE_ID") or "").strip()
+        try:
+            chosen_id, _devices = _choose_adb_device(adb, wanted)
+            png = _capture_screencap_png(adb, chosen_id, timeout=15)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        }
+        return Response(content=png, media_type="image/png", headers=headers)
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported device_type: {device_type}")
 
 
 @app.get("/api/scrcpy/status")
@@ -684,18 +827,7 @@ def _run_agent_in_thread(run: _RunState, payload: dict[str, Any]) -> None:
             run.emit({"type": "end", "ts": time.time(), "message": "Simulated run completed"})
             return
 
-        from phone_agent import PhoneAgent
-        from phone_agent.agent import AgentConfig
-        from phone_agent.device_factory import DeviceType, set_device_type
         from phone_agent.model.client import ModelConfig
-
-        if device_type == "adb":
-            set_device_type(DeviceType.ADB)
-        elif device_type == "hdc":
-            set_device_type(DeviceType.HDC)
-        else:
-            run.emit({"type": "error", "message": f"unsupported device_type: {device_type}", "ts": time.time()})
-            return
 
         def confirmation_callback(message: str) -> bool:
             run.emit(
@@ -721,19 +853,50 @@ def _run_agent_in_thread(run: _RunState, payload: dict[str, Any]) -> None:
             lang=lang,
             temperature=temperature,
         )
-        agent_config = AgentConfig(
-            max_steps=max_steps,
-            device_id=device_id,
-            verbose=False,
-            lang=lang,
-        )
 
-        agent = PhoneAgent(
-            model_config=model_config,
-            agent_config=agent_config,
-            confirmation_callback=confirmation_callback,
-            takeover_callback=takeover_callback,
-        )
+        # Use IOSPhoneAgent for iOS devices, PhoneAgent for Android/HarmonyOS
+        if device_type == "ios":
+            from phone_agent.agent_ios import IOSPhoneAgent, IOSAgentConfig
+
+            wda_url = os.getenv("PHONE_AGENT_WDA_URL", "http://localhost:8100")
+            agent_config = IOSAgentConfig(
+                max_steps=max_steps,
+                device_id=device_id,
+                wda_url=wda_url,
+                verbose=False,
+                lang=lang,
+            )
+            agent = IOSPhoneAgent(
+                model_config=model_config,
+                agent_config=agent_config,
+                confirmation_callback=confirmation_callback,
+                takeover_callback=takeover_callback,
+            )
+        elif device_type in ("adb", "hdc"):
+            from phone_agent import PhoneAgent
+            from phone_agent.agent import AgentConfig
+            from phone_agent.device_factory import DeviceType, set_device_type
+
+            if device_type == "adb":
+                set_device_type(DeviceType.ADB)
+            elif device_type == "hdc":
+                set_device_type(DeviceType.HDC)
+
+            agent_config = AgentConfig(
+                max_steps=max_steps,
+                device_id=device_id,
+                verbose=False,
+                lang=lang,
+            )
+            agent = PhoneAgent(
+                model_config=model_config,
+                agent_config=agent_config,
+                confirmation_callback=confirmation_callback,
+                takeover_callback=takeover_callback,
+            )
+        else:
+            run.emit({"type": "error", "message": f"unsupported device_type: {device_type}", "ts": time.time()})
+            return
 
         step_index = 0
         result = agent.step(task)
@@ -900,6 +1063,8 @@ def _run_executor_burst(
         set_device_type(DeviceType.ADB)
     elif device_type == "hdc":
         set_device_type(DeviceType.HDC)
+    elif device_type == "ios":
+        set_device_type(DeviceType.IOS)
     else:
         raise ValueError(f"unsupported device_type: {device_type}")
 
@@ -1096,6 +1261,8 @@ def _run_monitor_in_thread(run: _RunState, payload: dict[str, Any]) -> None:
                     set_device_type(DeviceType.ADB)
                 elif device_type == "hdc":
                     set_device_type(DeviceType.HDC)
+                elif device_type == "ios":
+                    set_device_type(DeviceType.IOS)
                 device_factory = get_device_factory()
             except Exception as e:
                 monitor_use_screenshot = False
