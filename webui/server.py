@@ -1397,11 +1397,14 @@ def run_task(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, 
 
 
 @app.post("/api/run/stop")
-def stop_run() -> dict[str, Any]:
+def stop_run(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    requested_run_id = str(payload.get("run_id") or "").strip() or None
     if not _current_run or _current_run.done_event.is_set():
         return {"ok": True, "stopped": False, "message": "no active run"}
+    if requested_run_id and requested_run_id != _current_run.run_id:
+        return {"ok": True, "stopped": False, "message": "run_id not active"}
     _current_run.cancel_event.set()
-    return {"ok": True, "stopped": True}
+    return {"ok": True, "stopped": True, "run_id": _current_run.run_id}
 
 
 @app.get("/api/run/stream")

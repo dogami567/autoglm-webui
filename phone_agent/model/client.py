@@ -1,6 +1,8 @@
 """Model client for AI inference using OpenAI-compatible API."""
 
+import ast
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +24,7 @@ class ModelConfig:
     top_p: float = 0.85
     frequency_penalty: float = 0.2
     extra_body: dict[str, Any] = field(default_factory=dict)
+    fallback_models: list[str] = field(default_factory=list)
     lang: str = "cn"  # Language for UI messages: 'cn' or 'en'
 
 
@@ -48,7 +51,12 @@ class ModelClient:
 
     def __init__(self, config: ModelConfig | None = None):
         self.config = config or ModelConfig()
-        self.client = OpenAI(base_url=self.config.base_url, api_key=self.config.api_key)
+        self.client = OpenAI(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            timeout=60.0,
+            max_retries=2,
+        )
 
     def request(self, messages: list[dict[str, Any]]) -> ModelResponse:
         """
@@ -63,14 +71,45 @@ class ModelClient:
         Raises:
             ValueError: If the response cannot be parsed.
         """
-        # Start timing
+        errors: list[dict[str, str | int | None]] = []
+        candidates = self._resolve_model_candidates()
+
+        for model_name in candidates:
+            for attempt in range(self._resolve_attempt_limit(model_name)):
+                try:
+                    response = self._request_once(messages, model_name)
+                    if model_name != self.config.model_name:
+                        print(
+                            f"[model-fallback] switched from {self.config.model_name} to {model_name}",
+                            flush=True,
+                        )
+                        self.config.model_name = model_name
+                    return response
+                except Exception as error:
+                    info = self._extract_error_info(error)
+                    errors.append(
+                        {
+                            "model": model_name,
+                            "code": info.get("code"),
+                            "status": info.get("status"),
+                            "message": info.get("message"),
+                        }
+                    )
+                    if self._should_retry_error(info) and attempt + 1 < self._resolve_attempt_limit(model_name):
+                        time.sleep(self._retry_delay_seconds(attempt))
+                        continue
+                    break
+
+        raise RuntimeError(self._format_request_failure(errors))
+
+    def _request_once(self, messages: list[dict[str, Any]], model_name: str) -> ModelResponse:
         start_time = time.time()
         time_to_first_token = None
         time_to_thinking_end = None
 
         stream = self.client.chat.completions.create(
             messages=messages,
-            model=self.config.model_name,
+            model=model_name,
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
@@ -80,9 +119,9 @@ class ModelClient:
         )
 
         raw_content = ""
-        buffer = ""  # Buffer to hold content that might be part of a marker
+        buffer = ""
         action_markers = ["finish(message=", "do(action="]
-        in_action_phase = False  # Track if we've entered the action phase
+        in_action_phase = False
         first_token_received = False
 
         for chunk in stream:
@@ -92,39 +131,29 @@ class ModelClient:
                 content = chunk.choices[0].delta.content
                 raw_content += content
 
-                # Record time to first token
                 if not first_token_received:
                     time_to_first_token = time.time() - start_time
                     first_token_received = True
 
                 if in_action_phase:
-                    # Already in action phase, just accumulate content without printing
                     continue
 
                 buffer += content
-
-                # Check if any marker is fully present in buffer
                 marker_found = False
                 for marker in action_markers:
                     if marker in buffer:
-                        # Marker found, print everything before it
                         thinking_part = buffer.split(marker, 1)[0]
                         print(thinking_part, end="", flush=True)
-                        print()  # Print newline after thinking is complete
+                        print()
                         in_action_phase = True
                         marker_found = True
-
-                        # Record time to thinking end
                         if time_to_thinking_end is None:
                             time_to_thinking_end = time.time() - start_time
-
                         break
 
                 if marker_found:
-                    continue  # Continue to collect remaining content
+                    continue
 
-                # Check if buffer ends with a prefix of any marker
-                # If so, don't print yet (wait for more content)
                 is_potential_marker = False
                 for marker in action_markers:
                     for i in range(1, len(marker)):
@@ -135,21 +164,16 @@ class ModelClient:
                         break
 
                 if not is_potential_marker:
-                    # Safe to print the buffer
                     print(buffer, end="", flush=True)
                     buffer = ""
 
-        # Calculate total time
         total_time = time.time() - start_time
-
-        # Parse thinking and action from response
         thinking, action = self._parse_response(raw_content)
 
-        # Print performance metrics
         lang = self.config.lang
         print()
         print("=" * 50)
-        print(f"⏱️  {get_message('performance_metrics', lang)}:")
+        print(f"[timing] {get_message('performance_metrics', lang)}:")
         print("-" * 50)
         if time_to_first_token is not None:
             print(
@@ -172,6 +196,112 @@ class ModelClient:
             time_to_thinking_end=time_to_thinking_end,
             total_time=total_time,
         )
+
+    def _resolve_model_candidates(self) -> list[str]:
+        candidates: list[str] = [self.config.model_name]
+        if self.config.fallback_models:
+            candidates.extend(self.config.fallback_models)
+
+        if "api.z.ai" in (self.config.base_url or "") and self.config.model_name == "autoglm-phone-multilingual":
+            candidates.extend(["glm-4.6v-flash", "glm-4.5v", "glm-4.6v-flashx"])
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate or candidate in seen:
+                continue
+            deduped.append(candidate)
+            seen.add(candidate)
+        return deduped
+
+    def _resolve_attempt_limit(self, model_name: str) -> int:
+        if "api.z.ai" in (self.config.base_url or "") and model_name != self.config.model_name:
+            return 2
+        return 2
+
+    def _extract_error_info(self, error: Exception) -> dict[str, str | int | None]:
+        status = getattr(error, "status_code", None)
+        body = getattr(error, "body", None)
+        code = None
+        message = str(error).strip()
+
+        if isinstance(body, dict):
+            err = body.get("error") if isinstance(body.get("error"), dict) else body
+            if isinstance(err, dict):
+                code = err.get("code")
+                body_message = err.get("message")
+                if isinstance(body_message, str) and body_message.strip():
+                    message = body_message.strip()
+
+        if code is None or not message:
+            match = re.search(r"Error code:\s*(\d+)\s*-\s*(\{.*\})", str(error))
+            if match:
+                if code is None:
+                    status = status or int(match.group(1))
+                try:
+                    parsed = ast.literal_eval(match.group(2))
+                except (SyntaxError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    err = parsed.get("error")
+                    if isinstance(err, dict):
+                        code = err.get("code", code)
+                        body_message = err.get("message")
+                        if isinstance(body_message, str) and body_message.strip():
+                            message = body_message.strip()
+
+        normalized_code = str(code).strip() if code is not None else None
+        normalized_message = message or "unknown error"
+
+        if "Bad gateway" in normalized_message and status is None:
+            status = 502
+
+        return {
+            "status": status if isinstance(status, int) else None,
+            "code": normalized_code,
+            "message": normalized_message,
+        }
+
+    def _should_retry_error(self, info: dict[str, str | int | None]) -> bool:
+        code = str(info.get("code") or "").strip()
+        status = info.get("status")
+        message = str(info.get("message") or "").lower()
+
+        if code == "1302":
+            return True
+        if isinstance(status, int) and status >= 500:
+            return True
+        return "bad gateway" in message or "timed out" in message
+
+    def _retry_delay_seconds(self, attempt: int) -> float:
+        return float(min(6, 2 * (attempt + 1)))
+
+    def _format_request_failure(self, errors: list[dict[str, str | int | None]]) -> str:
+        if not errors:
+            return "Model request failed"
+
+        parts: list[str] = []
+        for item in errors:
+            model = str(item.get("model") or "unknown-model")
+            code = str(item.get("code") or "").strip()
+            status = item.get("status")
+            message = str(item.get("message") or "unknown error").strip()
+
+            detail = message
+            if code:
+                detail = f"{code}: {detail}"
+            elif isinstance(status, int):
+                detail = f"HTTP {status}: {detail}"
+
+            parts.append(f"{model} -> {detail}")
+
+        if "api.z.ai" in (self.config.base_url or ""):
+            parts.append(
+                "z.ai 当前 key 对目标视觉模型可能未开通、已限流，或余额/资源包不足；可更换可用 key 或充值后重试"
+            )
+
+        return "Model request failed. Tried: " + "; ".join(parts)
 
     def _parse_response(self, content: str) -> tuple[str, str]:
         """
